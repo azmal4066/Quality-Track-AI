@@ -1,0 +1,3 @@
+{"model_version": "v1.0.0", "base": "yolov8n", "dataset": "NEU-DET (1440/180/180 split, seed 42)", "epochs": 100, "ultralytics": "8.4.215",
+ "val_metrics_reported_by_user_screenshot": {"mAP50": 0.749, "mAP50-95": 0.437, "precision": 0.729, "recall": 0.724},
+ "note": "Validation split numbers; test-split numbers were only partially visible. Weak classes: crazing, rolled-in_scale."}
