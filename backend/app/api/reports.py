@@ -220,17 +220,20 @@ def _head(title: str, subtitle: str = ""):
     return out
 
 
-def _fetch_inspection(iid: str):
+def _fetch_inspection(iid: str, uid: str | None = None):
     sb = get_supabase()
-    r = sb.table("inspections").select("*, products(product_code,name,category), profiles(full_name,email)").eq("id", iid).limit(1).execute().data
+    q = sb.table("inspections").select("*, products(product_code,name,category), profiles(full_name,email)").eq("id", iid)
+    if uid:
+        q = q.eq("inspector_id", uid)
+    r = q.limit(1).execute().data
     if not r:
         raise HTTPException(404, "Inspection not found")
     d = sb.table("defects").select("*").eq("inspection_id", iid).execute().data
     return r[0], d
 
 
-def inspection_pdf(iid: str) -> bytes:
-    i, defects = _fetch_inspection(iid)
+def inspection_pdf(iid: str, uid: str | None = None) -> bytes:
+    i, defects = _fetch_inspection(iid, uid)
     p, who = i.get("products") or {}, i.get("profiles") or {}
     stc = STATUS_HEX.get(i["status"], "#0F172A")
     conf = i.get("max_confidence")
@@ -268,8 +271,10 @@ def inspection_pdf(iid: str) -> bytes:
     return _doc(s, "Inspection Report")
 
 
-def _list(batch=None, month=None):
+def _list(batch=None, month=None, uid=None):
     q = get_supabase().table("inspections").select("id,status,quality_score,defect_count,batch_number,created_at,products(product_code)").order("created_at")
+    if uid:
+        q = q.eq("inspector_id", uid)
     if batch:
         q = q.eq("batch_number", batch)
     if month:
@@ -336,28 +341,28 @@ def generate(req: ReportRequest, user: CurrentUser = Depends(require_staff)):
     if req.type == "inspection":
         if not req.inspection_id:
             raise HTTPException(422, "inspection_id required")
-        body, mime, name = inspection_pdf(req.inspection_id), "application/pdf", f"inspection-{req.inspection_id[:8]}.pdf"
+        body, mime, name = inspection_pdf(req.inspection_id, user.id), "application/pdf", f"inspection-{req.inspection_id[:8]}.pdf"
     elif req.type == "batch":
         if not req.batch_number:
             raise HTTPException(422, "batch_number required")
-        items = _list(batch=req.batch_number)
+        items = _list(batch=req.batch_number, uid=user.id)
         if not items:
             raise HTTPException(404, "No inspections for that batch")
         body, mime, name = summary_pdf(f"Batch report {req.batch_number}", items), "application/pdf", f"batch-{req.batch_number}.pdf"
     elif req.type == "monthly":
         if not req.month or len(req.month) != 7:
             raise HTTPException(422, "month (YYYY-MM) required")
-        items = _list(month=req.month)
+        items = _list(month=req.month, uid=user.id)
         body, mime, name = summary_pdf(f"Monthly quality report {req.month}", items), "application/pdf", f"monthly-{req.month}.pdf"
     else:
-        items = _list(batch=req.batch_number, month=req.month)
+        items = _list(batch=req.batch_number, month=req.month, uid=user.id)
         body, mime, name = csv_bytes(items), "text/csv", "inspections.csv"
     sb = get_supabase()
-    sb.table("reports").insert({"inspection_id": req.inspection_id, "report_type": req.type}).execute()
+    sb.table("reports").insert({"inspection_id": req.inspection_id, "report_type": req.type, "owner_id": user.id}).execute()
     sb.table("audit_logs").insert({"user_id": user.id, "action": f"report.{req.type}", "entity_type": "report"}).execute()
     return Response(body, media_type=mime, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @router.get("/recent")
-def recent(_=Depends(require_staff)):
-    return get_supabase().table("reports").select("*").order("created_at", desc=True).limit(20).execute().data
+def recent(user=Depends(require_staff)):
+    return get_supabase().table("reports").select("*").eq("owner_id", user.id).order("created_at", desc=True).limit(20).execute().data
