@@ -7,10 +7,11 @@ router = APIRouter(prefix="/api/analytics", tags=["analytics"])
 
 
 @router.get("/overview")
-def overview(_=Depends(get_current_user)):
+def overview(user=Depends(get_current_user)):
     sb = get_supabase()
-    ins = sb.table("inspections").select("status,quality_score,created_at").execute().data
-    defs = sb.table("defects").select("defect_type,severity,status").execute().data
+    ins = sb.table("inspections").select("status,quality_score,created_at").eq("inspector_id", user.id).execute().data
+    defs = sb.table("defects").select("defect_type,severity,status,inspections!inner(inspector_id)") \
+        .eq("inspections.inspector_id", user.id).execute().data
     total = len(ins)
     c = Counter(i["status"] for i in ins)
     scores = [float(i["quality_score"]) for i in ins if i["quality_score"] is not None]
@@ -24,8 +25,8 @@ def overview(_=Depends(get_current_user)):
 
 
 @router.get("/trends")
-def trends(_=Depends(get_current_user)):
-    ins = get_supabase().table("inspections").select("status,quality_score,created_at").execute().data
+def trends(user=Depends(get_current_user)):
+    ins = get_supabase().table("inspections").select("status,quality_score,created_at").eq("inspector_id", user.id).execute().data
     daily = defaultdict(lambda: {"PASS": 0, "FAIL": 0, "REVIEW": 0})
     for i in ins:
         daily[i["created_at"][:10]][i["status"]] += 1
@@ -33,10 +34,10 @@ def trends(_=Depends(get_current_user)):
 
 
 @router.get("/breakdown")
-def breakdown(_=Depends(get_current_user)):
+def breakdown(user=Depends(get_current_user)):
     """Category, batch, inspector and monthly views, all computed from stored records."""
     sb = get_supabase()
-    ins = sb.table("inspections").select("status,quality_score,batch_number,inspector_id,created_at,products(category),profiles(full_name,email)").execute().data
+    ins = sb.table("inspections").select("status,quality_score,batch_number,inspector_id,created_at,products(category),profiles(full_name,email)").eq("inspector_id", user.id).execute().data
 
     def rate(rows):
         n = len(rows)
