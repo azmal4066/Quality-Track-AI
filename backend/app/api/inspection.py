@@ -46,7 +46,7 @@ def run_one(data: bytes, content_type: str, user: CurrentUser, product_code: str
 
     product_id = None
     if product_code:
-        p = sb.table("products").select("id").eq("product_code", product_code).limit(1).execute()
+        p = sb.table("products").select("id").eq("product_code", product_code).eq("owner_id", user.id).limit(1).execute()
         product_id = p.data[0]["id"] if p.data else None
 
     iid = str(uuid.uuid4())
@@ -112,10 +112,10 @@ async def demo(file: UploadFile = File(...), user: CurrentUser = Depends(require
 def finalize_batch(batch_number: str = Form(...), user: CurrentUser = Depends(require_staff)):
     """Recomputes batch counters from stored inspections (used after per-image batch processing)."""
     sb = get_supabase()
-    rows = sb.table("inspections").select("status").eq("batch_number", batch_number).execute().data
+    rows = sb.table("inspections").select("status").eq("batch_number", batch_number).eq("inspector_id", user.id).execute().data
     counts = {"total_items": len(rows), "passed_items": sum(r["status"] == "PASS" for r in rows),
               "failed_items": sum(r["status"] == "FAIL" for r in rows)}
-    sb.table("batches").upsert({"batch_number": batch_number, **counts}, on_conflict="batch_number").execute()
+    sb.table("batches").upsert({"owner_id": user.id, "batch_number": batch_number, **counts}, on_conflict="owner_id,batch_number").execute()
     return {"batch_number": batch_number, **counts}
 
 
@@ -137,8 +137,8 @@ async def batch(files: list[UploadFile] = File(...), batch_number: str = Form(..
                 raise
             items.append({"filename": f.filename, "ok": False, "error": e.detail})
     get_supabase().table("batches").upsert({
-        "batch_number": batch_number, "total_items": len(files),
-        "passed_items": passed, "failed_items": failed}, on_conflict="batch_number").execute()
+        "owner_id": user.id, "batch_number": batch_number, "total_items": len(files),
+        "passed_items": passed, "failed_items": failed}, on_conflict="owner_id,batch_number").execute()
     return {"batch_number": batch_number, "total": len(files), "passed": passed, "failed": failed, "items": items}
 
 
@@ -149,10 +149,10 @@ def history(limit: int = 50, offset: int = 0, status: str | None = None, batch: 
             user: CurrentUser = Depends(get_current_user)):
     sb = get_supabase()
     q = sb.table("inspections").select("*, products(product_code,name)") \
-        .order("created_at", desc=True).range(offset, offset + min(limit, 200) - 1)
+        .eq("inspector_id", user.id) \
+        .order("created_at", desc=True).range(offset, offset + min(limit, 200) - 1)  # each user sees only their own inspections
     if status: q = q.eq("status", status)
     if batch: q = q.eq("batch_number", batch)
-    if inspector_id: q = q.eq("inspector_id", inspector_id)
     if date_from: q = q.gte("created_at", date_from)
     if date_to:
         try:
@@ -161,7 +161,7 @@ def history(limit: int = 50, offset: int = 0, status: str | None = None, batch: 
             raise HTTPException(422, "date_to must be YYYY-MM-DD")
         q = q.lt("created_at", nxt)
     if product_code:
-        pr = sb.table("products").select("id").ilike("product_code", product_code).execute().data
+        pr = sb.table("products").select("id").eq("owner_id", user.id).ilike("product_code", product_code).execute().data
         if not pr:
             return []
         q = q.in_("product_id", [x["id"] for x in pr])
@@ -176,20 +176,20 @@ def history(limit: int = 50, offset: int = 0, status: str | None = None, batch: 
 @router.get("/{inspection_id}")
 def get_one(inspection_id: str, user: CurrentUser = Depends(get_current_user)):
     sb = get_supabase()
-    r = sb.table("inspections").select("*, products(product_code,name)").eq("id", inspection_id).single().execute()
-    if not r.data:
+    rows = sb.table("inspections").select("*, products(product_code,name)").eq("id", inspection_id) \
+        .eq("inspector_id", user.id).limit(1).execute().data
+    if not rows:
         raise HTTPException(404, "Inspection not found")
+    row = rows[0]
     d = sb.table("defects").select("*").eq("inspection_id", inspection_id).execute().data
-    r.data["original_url"] = signed_url("inspection-images", r.data["original_image_url"])
-    r.data["annotated_url"] = signed_url("annotated-images", r.data["annotated_image_url"])
-    return {**r.data, "defects": d}
+    row["original_url"] = signed_url("inspection-images", row["original_image_url"])
+    row["annotated_url"] = signed_url("annotated-images", row["annotated_image_url"])
+    return {**row, "defects": d}
 
 
 @router.delete("/{inspection_id}", status_code=204)
 def delete(inspection_id: str, user: CurrentUser = Depends(require_staff)):
-    if user.role == "inspector":
-        raise HTTPException(403, "Only admins can delete inspections")
     sb = get_supabase()
-    sb.table("inspections").delete().eq("id", inspection_id).execute()
+    sb.table("inspections").delete().eq("id", inspection_id).eq("inspector_id", user.id).execute()
     sb.table("audit_logs").insert({"user_id": user.id, "action": "inspection.delete",
                                    "entity_type": "inspection", "entity_id": inspection_id}).execute()
