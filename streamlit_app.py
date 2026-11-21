@@ -183,14 +183,14 @@ def login_view():
                 name = st.text_input("Full name", placeholder="Your full name")
                 email = st.text_input("Email", key="re", placeholder="you@company.com")
                 pw = st.text_input("Password (min 8)", type="password", key="rp", placeholder="At least 8 characters")
-                st.markdown('<div class="qt-hint">ℹ️<div>New accounts start as <b>Viewer</b>. An admin assigns your role.</div></div>', unsafe_allow_html=True)
+                st.markdown('<div class="qt-hint">ℹ️<div>Every new account starts as an <b>Inspector</b> and can use the app right away.</div></div>', unsafe_allow_html=True)
                 if st.form_submit_button("Create account  →", type="primary"):
                     if len(pw) < 8:
                         st.error("Password must be at least 8 characters.")
                     else:
                         try:
                             anon_client().auth.sign_up({"email": email, "password": pw, "options": {"data": {"full_name": name}}})
-                            st.success("Account created. Check your email if confirmation is on, then sign in. An admin must set your role.")
+                            st.success("Account created. You can sign in now.")
                         except Exception as e:
                             st.error(f"Could not register: {e}")
         st.markdown('<div class="qt-foot2">Protected by Supabase Auth · QualityTrack AI</div>', unsafe_allow_html=True)
@@ -214,14 +214,19 @@ def get_categories():
     return list(dict.fromkeys(saved + DEFAULT_CATEGORIES))
 
 
+def _uid():
+    """Id of the signed-in user. Every query below is scoped to it so users never see each other's data."""
+    return st.session_state.user.id
+
+
 def ensure_product(code, category):
     """Create the product (with the chosen category) when a new Product ID is inspected, so the category is actually stored."""
     if not code or not category:
         return
     try:
         sb = get_supabase()
-        if not sb.table("products").select("id").eq("product_code", code).limit(1).execute().data:
-            sb.table("products").insert({"product_code": code, "name": code, "category": category}).execute()
+        if not sb.table("products").select("id").eq("product_code", code).eq("owner_id", _uid()).limit(1).execute().data:
+            sb.table("products").insert({"product_code": code, "name": code, "category": category, "owner_id": _uid()}).execute()
     except Exception:
         pass
 
@@ -388,7 +393,7 @@ def page_dashboard(user):
         st.bar_chart(cat, color="#06B6D4", horizontal=True)
         st.caption("Pass rate (%) by category")
 
-    defs = pd.DataFrame(get_supabase().table("defects").select("defect_type,severity,status").limit(5000).execute().data)
+    defs = pd.DataFrame(_own_defects("defect_type,severity,status"))
     c, d = st.columns(2)
     with c.container(border=True):
         section("Defect types")
@@ -462,8 +467,12 @@ def page_inspect(user):
             st.caption(f"Inspection ID {r['id']} saved. Model confidence and quality score are different measures.")
 
 
+def _own_defects(cols):
+    return get_supabase().table("defects").select(f"{cols}, inspections!inner(inspector_id)").eq("inspections.inspector_id", _uid()).limit(5000).execute().data
+
+
 def inspections_df(limit=500):
-    rows = get_supabase().table("inspections").select("*, products(product_code,name,category)").order("created_at", desc=True).limit(limit).execute().data
+    rows = get_supabase().table("inspections").select("*, products(product_code,name,category)").eq("inspector_id", _uid()).order("created_at", desc=True).limit(limit).execute().data
     df = pd.DataFrame(rows)
     if not df.empty:
         df["product"] = df["products"].apply(lambda p: (p or {}).get("product_code"))
@@ -492,14 +501,14 @@ def page_history(user):
         a, b = st.columns(2)
         a.image(sign_url("inspection-images", row["original_image_url"]) or "", caption="Original")
         b.image(sign_url("annotated-images", row["annotated_image_url"]) or "", caption="Annotated")
-        defs = get_supabase().table("defects").select("defect_type,severity,confidence,status,corrective_action").eq("inspection_id", pick).execute().data
+        defs = get_supabase().table("defects").select("defect_type,severity,confidence,status,corrective_action, inspections!inner(inspector_id)").eq("inspection_id", pick).eq("inspections.inspector_id", _uid()).execute().data
         st.dataframe(pd.DataFrame(defs), hide_index=True) if defs else st.caption("No defects detected by the model.")
 
 
 def page_defects(user):
     page_header("Defect Management", "Track, review and resolve detected defects.")
     q = st.selectbox("Status filter", ["All", "open", "under_review", "resolved", "closed"])
-    qry = get_supabase().table("defects").select("*").order("created_at", desc=True).limit(200)
+    qry = get_supabase().table("defects").select("*, inspections!inner(inspector_id)").eq("inspections.inspector_id", _uid()).order("created_at", desc=True).limit(200)
     if q != "All": qry = qry.eq("status", q)
     rows = qry.execute().data
     if not rows:
@@ -515,7 +524,8 @@ def page_defects(user):
             if st.form_submit_button("Update"):
                 patch = {"status": ns}
                 if ca: patch["corrective_action"] = ca
-                get_supabase().table("defects").update(patch).eq("id", did).execute()
+                if get_supabase().table("defects").select("id, inspections!inner(inspector_id)").eq("id", did).eq("inspections.inspector_id", _uid()).execute().data:
+                    get_supabase().table("defects").update(patch).eq("id", did).execute()
                 st.success("Updated")
                 st.rerun()
 
@@ -542,7 +552,7 @@ def page_analytics(user):
     with st.container(border=True):
         section("Batch-wise comparison")
         status_chart(df.assign(batch=df["batch_number"].fillna("No batch")), "batch")
-    defs = pd.DataFrame(get_supabase().table("defects").select("defect_type,severity").limit(5000).execute().data)
+    defs = pd.DataFrame(_own_defects("defect_type,severity"))
     if not defs.empty:
         a, b = st.columns(2)
         a.markdown('<div class="qt-sec">Defect frequency</div>', unsafe_allow_html=True); a.bar_chart(defs["defect_type"].value_counts(), color="#3B82F6")
@@ -583,13 +593,13 @@ def page_reports(user):
         label = {r["id"]: f"{r['created_at'].strftime('%d %b %Y %H:%M')} · {r['product'] or 'No product'} · {r['status']} · {r['id'][:8]}" for _, r in df.iterrows()}
         pick = st.selectbox("Inspection", list(label), format_func=label.get)
         _report_block("insp", "inspection PDF", "One inspection with images, defects and a sign-off line.",
-                      f"inspection-{pick[:8]}.pdf", lambda: rp.inspection_pdf(pick))
+                      f"inspection-{pick[:8]}.pdf", lambda: rp.inspection_pdf(pick, _uid()))
 
     with tab_m:
         month = st.selectbox("Month", months)
 
         def monthly():
-            items = rp._list(month=month)
+            items = rp._list(month=month, uid=_uid())
             if not items:
                 raise ValueError("No inspections found for that month.")
             return rp.summary_pdf(f"Monthly quality report {month}", items)
@@ -603,7 +613,7 @@ def page_reports(user):
             bn = st.selectbox("Batch", batches)
 
             def batch_pdf():
-                items = rp._list(batch=bn)
+                items = rp._list(batch=bn, uid=_uid())
                 if not items:
                     raise ValueError("No inspections found for that batch.")
                 return rp.summary_pdf(f"Batch report {bn}", items)
@@ -615,7 +625,7 @@ def page_reports(user):
         cm = c1.selectbox("Month", ["All months"] + months, key="csv_month")
         cb = c2.selectbox("Batch", ["All batches"] + batches, key="csv_batch")
         _report_block("csv", "CSV", "Spreadsheet export of inspections (opens in Excel).", f"inspections-{cm.replace(' ', '-')}-{str(cb).replace(' ', '-')}.csv".replace("/", "_"),
-                      lambda: rp.csv_bytes(rp._list(batch=None if cb == "All batches" else cb, month=None if cm == "All months" else cm)), mime="text/csv")
+                      lambda: rp.csv_bytes(rp._list(batch=None if cb == "All batches" else cb, month=None if cm == "All months" else cm, uid=_uid())), mime="text/csv")
 
 
 def page_model(user):
